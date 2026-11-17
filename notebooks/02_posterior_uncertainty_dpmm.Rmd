@@ -1,0 +1,272 @@
+---
+title: "DPMM uncertainty quantification for integrated squared density"
+output: html_document
+---
+
+This notebook evaluates DPMM credible intervals for integrated squared density
+under the standard Laplace density. Results are saved after each replication;
+completed replications are skipped on rerun.
+
+```{r dpmm-coverage}
+DIMENSION <- 1L
+N_REPETITIONS <- 1000L
+N_TRAIN <- 5000L
+POSTERIOR_DRAWS <- 1000L
+TRUE_ISD <- 0.25  # exact: integral (exp(-|z|)/2)^2 dz
+CREDIBLE_LEVEL <- 0.95
+MASTER_SEED <- 2026L
+OVERWRITE <- FALSE
+
+BURN_IN <- 1000L
+
+if (!requireNamespace("BNPmix", quietly = TRUE)) {
+  stop("Install BNPmix first with install.packages('BNPmix').")
+}
+
+sample_laplace <- function(n) {
+  matrix(rexp(n * DIMENSION) - rexp(n * DIMENSION), ncol = DIMENSION)
+}
+
+fit_dpmm <- function(x, seed) {
+  set.seed(seed)
+  BNPmix::PYdensity(
+    y = as.numeric(x),
+    mcmc = list(
+      niter = BURN_IN + POSTERIOR_DRAWS, nburn = BURN_IN,
+      method = "ICS", model = "LS", hyper = TRUE, print_message = FALSE
+    ),
+    prior = list(strength = 1, discount = 0),
+    # Return mixture parameters without evaluating a density grid.
+    output = list(out_type = "CLUST", out_param = TRUE)
+  )
+}
+
+gaussian_mixture_isd <- function(fit) {
+  vapply(seq_along(fit$probs), function(i) {
+    weights <- as.numeric(fit$probs[[i]])
+    means <- as.numeric(fit$mean[[i]])
+    variances <- as.numeric(fit$sigma2[[i]])
+    overlap <- dnorm(
+      outer(means, means, "-"),
+      sd = sqrt(outer(variances, variances, "+"))
+    )
+    sum(outer(weights, weights) * overlap)
+  }, numeric(1))
+}
+
+project_root <- normalizePath(getwd(), winslash = "/", mustWork = TRUE)
+if (basename(project_root) == "notebooks") project_root <- dirname(project_root)
+result_dir <- file.path(project_root, "results", "posterior_uncertainty")
+output_file <- file.path(result_dir, "laplace_isd_coverage_dpmm.csv")
+summary_file <- file.path(result_dir, "laplace_isd_coverage_dpmm_summary.csv")
+dir.create(dirname(output_file), recursive = TRUE, showWarnings = FALSE)
+
+columns <- c(
+  "repetition", "data_seed", "mcmc_seed", "n_train", "posterior_draws",
+  "burn_in", "credible_level", "integration", "true_isd",
+  "posterior_mean", "posterior_sd", "bias", "interval_length", "ci_lower",
+  "ci_upper", "covered", "fit_and_posterior_time_seconds",
+  "total_time_seconds"
+)
+
+add_checkpoint_summary <- function(x) {
+  summary_columns <- c(
+    "posterior_mean", "posterior_sd", "bias", "interval_length", "ci_lower", "ci_upper", "covered",
+    "fit_and_posterior_time_seconds", "total_time_seconds"
+  )
+  mean_row <- as.list(rep(NA, ncol(x)))
+  se_row <- as.list(rep(NA, ncol(x)))
+  names(mean_row) <- names(se_row) <- names(x)
+  mean_row$repetition <- "Mean"
+  se_row$repetition <- "Standard error"
+  for (column in summary_columns) {
+    values <- suppressWarnings(as.numeric(x[[column]]))
+    values <- values[is.finite(values)]
+    if (length(values)) mean_row[[column]] <- mean(values)
+    if (length(values) > 1L) {
+      se_row[[column]] <- sd(values) / sqrt(length(values))
+    }
+  }
+  rbind(x, as.data.frame(mean_row, check.names = FALSE),
+        as.data.frame(se_row, check.names = FALSE))
+}
+
+write_checkpoint_csv <- function(x, path, add_summary = TRUE) {
+  if (add_summary) x <- add_checkpoint_summary(x)
+  temporary <- paste0(path, ".tmp")
+  write.csv(x, temporary, row.names = FALSE)
+  if (!file.copy(temporary, path, overwrite = TRUE)) stop("Could not update ", path)
+  unlink(temporary)
+}
+
+if (file.exists(output_file) && !OVERWRITE) {
+  results <- read.csv(output_file, check.names = FALSE)
+  if (!setequal(names(results), columns)) {
+    stop("Saved result columns do not match this experiment. Use a separate output file or clear the incompatible results.")
+  }
+  numeric_repetition <- suppressWarnings(as.integer(results$repetition))
+  results <- results[!is.na(numeric_repetition), , drop = FALSE]
+  results$repetition <- numeric_repetition[!is.na(numeric_repetition)]
+  numeric_columns <- setdiff(columns, c("covered", "integration"))
+  results[numeric_columns] <- lapply(
+    results[numeric_columns], function(x) suppressWarnings(as.numeric(x))
+  )
+  results$covered <- results$ci_lower <= TRUE_ISD & TRUE_ISD <= results$ci_upper
+  if (nrow(results)) {
+    expected_settings <- list(
+      n_train = N_TRAIN, posterior_draws = POSTERIOR_DRAWS,
+      burn_in = BURN_IN, credible_level = CREDIBLE_LEVEL,
+      integration = "analytic", true_isd = TRUE_ISD
+    )
+    for (column in names(expected_settings)) {
+      if (!all(results[[column]] == expected_settings[[column]])) {
+        stop("Saved results: ", column, " does not match the current experiment")
+      }
+    }
+    if (any(results$data_seed != MASTER_SEED + results$repetition - 1L) ||
+        any(results$mcmc_seed != MASTER_SEED + 2000000L + results$repetition - 1L)) {
+      stop("Saved results: random seeds do not match")
+    }
+  }
+} else {
+  results <- as.data.frame(setNames(replicate(length(columns), logical(0), simplify = FALSE), columns))
+}
+write_checkpoint_csv(results, output_file)
+cat(sprintf("true ISD = %.10g (exact)\n", TRUE_ISD))
+cat("output =", output_file, "\n")
+
+tail_probability <- (1 - CREDIBLE_LEVEL) / 2
+completed <- if (nrow(results)) as.integer(results$repetition) else integer(0)
+
+for (repetition in seq_len(N_REPETITIONS)) {
+  if (repetition %in% completed) next
+  cat(sprintf("DPMM repetition %04d/%04d started at %s.\n",
+              repetition, N_REPETITIONS, format(Sys.time(), "%H:%M:%S")))
+  flush.console()
+  total_start <- proc.time()[["elapsed"]]
+  data_seed <- MASTER_SEED + repetition - 1L
+  set.seed(data_seed)
+  x_train <- sample_laplace(N_TRAIN)
+
+  mcmc_seed <- MASTER_SEED + 2000000L + repetition - 1L
+  fit_start <- proc.time()[["elapsed"]]
+  fit <- fit_dpmm(x_train, mcmc_seed)
+  isd_draws <- gaussian_mixture_isd(fit)
+  if (length(isd_draws) != POSTERIOR_DRAWS) stop("Unexpected number of posterior draws")
+  interval <- quantile(
+    isd_draws, c(tail_probability, 1 - tail_probability), names = FALSE
+  )
+  total_time <- proc.time()[["elapsed"]] - total_start
+  fit_and_posterior_time <- proc.time()[["elapsed"]] - fit_start
+
+  row <- data.frame(
+    repetition = repetition,
+    data_seed = data_seed,
+    mcmc_seed = mcmc_seed,
+    n_train = N_TRAIN,
+    posterior_draws = POSTERIOR_DRAWS,
+    burn_in = BURN_IN,
+    credible_level = CREDIBLE_LEVEL,
+    integration = "analytic",
+    true_isd = TRUE_ISD,
+    posterior_mean = mean(isd_draws),
+    posterior_sd = sd(isd_draws),
+    bias = mean(isd_draws) - TRUE_ISD,
+    interval_length = interval[[2]] - interval[[1]],
+    ci_lower = interval[[1]],
+    ci_upper = interval[[2]],
+    covered = interval[[1]] <= TRUE_ISD && TRUE_ISD <= interval[[2]],
+    fit_and_posterior_time_seconds = fit_and_posterior_time,
+    total_time_seconds = total_time
+  )
+  results <- rbind(results, row)
+  results <- results[order(as.integer(results$repetition)), columns]
+  write_checkpoint_csv(results, output_file)
+
+  cat(sprintf(
+    "  finished: coverage=%.3f, replicate_time=%.1fs\n",
+    mean(as.logical(results$covered)), total_time
+  ))
+  flush.console()
+}
+
+coverage <- mean(as.logical(results$covered))
+summary <- data.frame(
+  method = "BNPmix Gaussian DPMM (ICS, location-scale mixture)",
+  integration = "analytic",
+  truth = "Laplace(0, 1)",
+  dimension = DIMENSION,
+  completed_repetitions = nrow(results),
+  true_isd_exact = TRUE_ISD,
+  coverage_rate = coverage,
+  coverage_monte_carlo_se = sqrt(coverage * (1 - coverage) / nrow(results)),
+  mean_interval_width = mean(results$ci_upper - results$ci_lower),
+  mean_bias = mean(results$bias),
+  mean_fit_and_posterior_time_seconds = mean(results$fit_and_posterior_time_seconds),
+  se_fit_and_posterior_time_seconds = sd(results$fit_and_posterior_time_seconds) / sqrt(nrow(results)),
+  mean_total_time_seconds = mean(results$total_time_seconds),
+  total_compute_time_seconds = sum(results$total_time_seconds)
+)
+write_checkpoint_csv(summary, summary_file, add_summary = FALSE)
+print(summary)
+```
+
+## Posterior comparison on a shared dataset
+
+This section generates one Laplace dataset and saves it with the DPMM ISD
+posterior draws. The final section of `02_posterior_uncertainty.ipynb` fits GEB
+to the saved dataset and plots both posterior distributions. Run this section
+before generating the comparison figure in Python.
+
+```{r posterior-comparison}
+COMPARISON_DATA_SEED <- 2034L
+COMPARISON_MCMC_SEED <- 2002026L
+
+comparison_dir <- file.path(project_root, "results", "posterior_uncertainty")
+dir.create(comparison_dir, recursive = TRUE, showWarnings = FALSE)
+
+comparison_settings <- data.frame(
+  data_seed = COMPARISON_DATA_SEED,
+  mcmc_seed = COMPARISON_MCMC_SEED,
+  n_train = N_TRAIN,
+  posterior_draws = POSTERIOR_DRAWS,
+  burn_in = BURN_IN,
+  integration = "analytic"
+)
+settings_file <- file.path(comparison_dir, "posterior_comparison_settings.csv")
+comparison_files <- file.path(comparison_dir, c(
+  "x_train.csv", "dpmm_draws.csv", "posterior_comparison_settings.csv"
+))
+comparison_complete <- !OVERWRITE && all(file.exists(comparison_files)) &&
+  isTRUE(all.equal(read.csv(settings_file), comparison_settings, check.attributes = FALSE))
+if (comparison_complete) {
+  comparison_complete <- nrow(read.csv(comparison_files[[1]])) == N_TRAIN &&
+    nrow(read.csv(comparison_files[[2]])) == POSTERIOR_DRAWS
+}
+if (comparison_complete) {
+  cat("Comparison data and posterior draws already saved; skipped.\n")
+} else {
+  set.seed(COMPARISON_DATA_SEED)
+  comparison_x <- sample_laplace(N_TRAIN)
+  cat("Fitting DPMM to the comparison dataset.\n")
+  flush.console()
+  comparison_fit <- fit_dpmm(comparison_x, COMPARISON_MCMC_SEED)
+  comparison_dpmm_isd <- gaussian_mixture_isd(comparison_fit)
+
+  write.csv(
+    data.frame(x = as.numeric(comparison_x)),
+    file.path(comparison_dir, "x_train.csv"), row.names = FALSE
+  )
+  write.csv(
+    data.frame(isd = comparison_dpmm_isd),
+    file.path(comparison_dir, "dpmm_draws.csv"), row.names = FALSE
+  )
+  write.csv(
+    comparison_settings,
+    file.path(comparison_dir, "posterior_comparison_settings.csv"),
+    row.names = FALSE
+  )
+  cat("Saved comparison data and DPMM posterior draws to: ",
+      comparison_dir, "\n", sep = "")
+}
+```
