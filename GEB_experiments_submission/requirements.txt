@@ -1,9 +1,0 @@
-numpy>=1.26
-pandas>=2.1
-scipy>=1.11
-scikit-learn>=1.4
-ucimlrepo>=0.0.7
-jax>=0.4
-jaxlib>=0.4
-jupyter>=1.0
-matplotlib>=3.8
