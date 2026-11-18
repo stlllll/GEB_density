@@ -2,6 +2,7 @@
 
 Code for the experiments in *Greedy empirical Bayes for density estimation*.
 See the paper and appendix for methodological details and experimental settings.
+Paper link: https://arxiv.org/abs/2611.22796
 
 ## Contents
 
